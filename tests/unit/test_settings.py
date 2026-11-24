@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from geo_document_reviewer.config.settings import PROJECT_ROOT, settings
+import pytest
+from pydantic import ValidationError
+
+from geo_document_reviewer.config.settings import PROJECT_ROOT, Settings, settings
 
 
 def test_project_root_exists():
@@ -42,3 +45,44 @@ def test_configured_paths_are_path_objects():
     assert isinstance(settings.reports_dir, Path)
     assert isinstance(settings.output_dir, Path)
     assert isinstance(settings.crs_template_path, Path)
+
+
+def test_default_ocr_language():
+    assert settings.ocr_language == "eng"
+
+
+def test_default_ocr_dpi():
+    assert settings.ocr_dpi == 300
+
+
+@pytest.mark.parametrize("dpi", [71, 601, 0, -1])
+def test_rejects_invalid_ocr_dpi(dpi):
+    with pytest.raises(ValidationError):
+        Settings(ocr_dpi=dpi, _env_file=None)
+
+
+def test_accepts_valid_ocr_dpi():
+    configured_settings = Settings(ocr_dpi=400, _env_file=None)
+
+    assert configured_settings.ocr_dpi == 400
+
+
+def test_reads_ocr_environment_variables(monkeypatch):
+    monkeypatch.setenv("OCR_LANGUAGE", "fra")
+    monkeypatch.setenv("OCR_DPI", "400")
+    monkeypatch.setenv(
+        "TESSERACT_CMD",
+        "/custom/path/tesseract",
+    )
+
+    configured_settings = Settings(_env_file=None)
+
+    assert configured_settings.ocr_language == "fra"
+    assert configured_settings.ocr_dpi == 400
+    assert configured_settings.tesseract_cmd == "/custom/path/tesseract"
+
+
+def test_tesseract_command_defaults_to_none():
+    configured_settings = Settings(_env_file=None)
+
+    assert configured_settings.tesseract_cmd is None
