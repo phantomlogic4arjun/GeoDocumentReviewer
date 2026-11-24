@@ -22,16 +22,61 @@ class ReviewServiceError(Exception):
 
 
 class ReviewService:
-    """Runs an evidence-based geotechnical review using OpenRouter."""
+    """Runs evidence-based geotechnical reviews using Ollama or OpenRouter."""
+
+    def __init__(self, provider: str = "openrouter", model: str | None = None):
+        self.provider = provider.lower()
+        self.model = model
+
+        if self.provider not in {"ollama", "openrouter"}:
+            raise ReviewServiceError(f"Unsupported AI provider: {provider}")
+
+    @staticmethod
+    def list_ollama_models() -> list[str]:
+        """Discover models installed in the local Ollama instance."""
+        try:
+            response = httpx.get(
+                f"{settings.ollama_base_url.rstrip('/')}/api/tags",
+                timeout=10,
+            )
+            response.raise_for_status()
+
+            return sorted(
+                model["name"] for model in response.json().get("models", []) if model.get("name")
+            )
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            raise ReviewServiceError(
+                "Cannot connect to Ollama. Make sure Ollama is running."
+            ) from exc
+
+    @staticmethod
+    def list_openrouter_models() -> list[str]:
+        """Retrieve available model identifiers from OpenRouter."""
+        try:
+            response = httpx.get(
+                "https://openrouter.ai/api/v1/models",
+                timeout=20,
+            )
+            response.raise_for_status()
+
+            return sorted(
+                model["id"] for model in response.json().get("data", []) if model.get("id")
+            )
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            raise ReviewServiceError("Unable to retrieve OpenRouter models.") from exc
 
     def review(
         self,
         document: ProcessedDocument,
         topics: list[str],
     ) -> tuple[ReviewAssessment, dict]:
-        api_key = settings.openrouter_api_key
-        if not api_key:
-            raise ReviewServiceError("OPENROUTER_API_KEY is missing from the project .env file.")
+        """Review a processed document using the selected provider."""
+        if not topics:
+            raise ReviewServiceError("Select at least one review topic.")
+
+        model = self.model or (
+            settings.llm_model if self.provider == "ollama" else settings.openrouter_model
+        )
 
         report_text = "\n\n".join(
             f"--- PDF PAGE {page.page_number} ---\n{page.review_text}" for page in document.pages
@@ -44,77 +89,159 @@ class ReviewService:
             f"BEGIN REPORT\n{report_text}\nEND REPORT"
         )
 
-        payload = {
-            "model": settings.openrouter_model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 3500,
-            "reasoning": {"enabled": False},
-        }
-
         try:
-            response = httpx.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=600,
-            )
-            response.raise_for_status()
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-
-            if not content:
-                raise ReviewServiceError("The AI returned an empty response.")
-
-            content = re.sub(
-                r"^\s*```(?:json)?\s*|\s*```\s*$",
-                "",
-                content.strip(),
-            )
-            parsed = json.loads(content)
-
-            findings = []
-            for item in parsed["assessments"]:
-                decision = ReviewDecision(item["decision"])
-                comment = item.get("proposed_comment")
-
-                findings.append(
-                    ReviewFinding(
-                        topic=item["topic"],
-                        decision=decision,
-                        proposed_comment=comment,
-                        category=(
-                            ReviewCategory(item["category"]) if item.get("category") else None
-                        ),
-                        criticality=(
-                            Criticality(item["criticality"]) if item.get("criticality") else None
-                        ),
-                        supporting_evidence=tuple(
-                            ReviewEvidence(**evidence)
-                            for evidence in item.get("supporting_evidence", [])
-                        ),
-                        reasoning=item["reasoning"],
-                        information_gaps=tuple(item.get("information_gaps", [])),
-                        confidence=Confidence(item["confidence"]),
-                    )
+            if self.provider == "ollama":
+                content, usage, actual_model = self._review_ollama(
+                    model,
+                    user_prompt,
                 )
+            else:
+                content, usage, actual_model = self._review_openrouter(
+                    model,
+                    user_prompt,
+                )
+
+            parsed = self._parse_content(content)
+
+            findings = tuple(
+                ReviewFinding(
+                    topic=item["topic"],
+                    decision=ReviewDecision(item["decision"]),
+                    proposed_comment=item.get("proposed_comment"),
+                    category=(ReviewCategory(item["category"]) if item.get("category") else None),
+                    criticality=(
+                        Criticality(item["criticality"]) if item.get("criticality") else None
+                    ),
+                    supporting_evidence=tuple(
+                        ReviewEvidence(**evidence)
+                        for evidence in item.get("supporting_evidence", [])
+                    ),
+                    reasoning=item["reasoning"],
+                    information_gaps=tuple(item.get("information_gaps", [])),
+                    confidence=Confidence(item["confidence"]),
+                )
+                for item in parsed["assessments"]
+            )
 
             assessment = ReviewAssessment(
                 source_file=document.file_name,
                 page_count=document.page_count,
-                model_name=result.get("model", settings.openrouter_model),
-                findings=tuple(findings),
+                model_name=f"{self.provider}: {actual_model}",
+                findings=findings,
             )
 
-            return assessment, result.get("usage", {})
+            return assessment, usage
 
         except ReviewServiceError:
             raise
-        except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+        except (
+            httpx.HTTPError,
+            KeyError,
+            ValueError,
+            TypeError,
+            IndexError,
+        ) as exc:
             raise ReviewServiceError(f"Unable to complete or validate AI review: {exc}") from exc
+
+    def _review_ollama(
+        self,
+        model: str,
+        user_prompt: str,
+    ) -> tuple[str, dict, str]:
+        """Send the review request to the local Ollama API."""
+        response = httpx.post(
+            f"{settings.ollama_base_url.rstrip('/')}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "format": "json",
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                },
+            },
+            timeout=900,
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        content = result.get("message", {}).get("content")
+
+        if not content:
+            raise ReviewServiceError("Ollama returned an empty response.")
+
+        usage = {
+            "prompt_tokens": result.get("prompt_eval_count", 0),
+            "completion_tokens": result.get("eval_count", 0),
+            "cost": None,
+        }
+
+        return content, usage, result.get("model", model)
+
+    def _review_openrouter(
+        self,
+        model: str,
+        user_prompt: str,
+    ) -> tuple[str, dict, str]:
+        """Send the review request to OpenRouter."""
+        api_key = settings.openrouter_api_key
+
+        if not api_key:
+            raise ReviewServiceError("OPENROUTER_API_KEY is missing from the project .env file.")
+
+        response = httpx.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 3500,
+                "reasoning": {"enabled": False},
+            },
+            timeout=900,
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        content = result["choices"][0]["message"]["content"]
+
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+
+        if not content:
+            raise ReviewServiceError("OpenRouter returned an empty response.")
+
+        return (
+            content,
+            result.get("usage", {}),
+            result.get("model", model),
+        )
+
+    @staticmethod
+    def _parse_content(content: str) -> dict:
+        """Parse the model response and validate its top-level structure."""
+        content = re.sub(
+            r"^\s*```(?:json)?\s*|\s*```\s*$",
+            "",
+            content.strip(),
+        )
+
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ReviewServiceError(f"The model did not return valid JSON: {exc}") from exc
+
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("assessments"), list):
+            raise ReviewServiceError("The model response must contain an assessments list.")
+
+        return parsed
