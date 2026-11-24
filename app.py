@@ -49,7 +49,7 @@ with st.sidebar:
 
     document_number = st.text_input(
         "Document number",
-        value="May Road GIR",
+        value="",
     )
     revision = st.text_input("Revision", value="0")
     reviewer = st.text_input("Reviewer name")
