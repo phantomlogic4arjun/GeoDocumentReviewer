@@ -1,5 +1,6 @@
 import json
 import re
+import threading
 
 import httpx
 
@@ -19,6 +20,50 @@ from geo_document_reviewer.review.prompts.engineering_review import SYSTEM_PROMP
 
 class ReviewServiceError(Exception):
     """Raised when an AI review cannot be completed."""
+
+
+class ReviewCancelledError(ReviewServiceError):
+    """Raised when an AI review is cancelled by the user."""
+
+
+class ReviewCancellation:
+    """Coordinates cancellation between the UI and the review worker."""
+
+    def __init__(self):
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._response = None
+
+    @property
+    def cancelled(self):
+        return self._event.is_set()
+
+    def attach_response(self, response):
+        with self._lock:
+            self._response = response
+            should_close = self.cancelled
+
+        if should_close:
+            response.close()
+
+    def detach_response(self, response):
+        """Release the response reference when streaming finishes."""
+        with self._lock:
+            if self._response is response:
+                self._response = None
+
+    def cancel(self):
+        self._event.set()
+
+        with self._lock:
+            response = self._response
+
+        if response is not None:
+            response.close()
+
+    def raise_if_cancelled(self):
+        if self.cancelled:
+            raise ReviewCancelledError("Review cancelled by user.")
 
 
 class ReviewService:
@@ -44,6 +89,7 @@ class ReviewService:
             return sorted(
                 model["name"] for model in response.json().get("models", []) if model.get("name")
             )
+
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             raise ReviewServiceError(
                 "Cannot connect to Ollama. Make sure Ollama is running."
@@ -62,6 +108,7 @@ class ReviewService:
             return sorted(
                 model["id"] for model in response.json().get("data", []) if model.get("id")
             )
+
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             raise ReviewServiceError("Unable to retrieve OpenRouter models.") from exc
 
@@ -69,14 +116,20 @@ class ReviewService:
         self,
         document: ProcessedDocument,
         topics: list[str],
+        cancellation: ReviewCancellation | None = None,
     ) -> tuple[ReviewAssessment, dict]:
         """Review a processed document using the selected provider."""
+
         if not topics:
             raise ReviewServiceError("Select at least one review topic.")
 
-        model = self.model or (
-            settings.llm_model if self.provider == "ollama" else settings.openrouter_model
-        )
+        if not self.model:
+            raise ReviewServiceError("An AI model must be selected.")
+
+        if cancellation:
+            cancellation.raise_if_cancelled()
+
+        model = self.model
 
         report_text = "\n\n".join(
             f"--- PDF PAGE {page.page_number} ---\n{page.review_text}" for page in document.pages
@@ -94,12 +147,16 @@ class ReviewService:
                 content, usage, actual_model = self._review_ollama(
                     model,
                     user_prompt,
+                    cancellation,
                 )
             else:
                 content, usage, actual_model = self._review_openrouter(
                     model,
                     user_prompt,
                 )
+
+            if cancellation:
+                cancellation.raise_if_cancelled()
 
             parsed = self._parse_content(content)
 
@@ -134,6 +191,7 @@ class ReviewService:
 
         except ReviewServiceError:
             raise
+
         except (
             httpx.HTTPError,
             KeyError,
@@ -147,39 +205,83 @@ class ReviewService:
         self,
         model: str,
         user_prompt: str,
+        cancellation: ReviewCancellation | None = None,
     ) -> tuple[str, dict, str]:
-        """Send the review request to the local Ollama API."""
-        response = httpx.post(
-            f"{settings.ollama_base_url.rstrip('/')}/api/chat",
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "format": "json",
-                "stream": False,
-                "options": {
-                    "temperature": 0.1,
-                },
-            },
-            timeout=900,
-        )
-        response.raise_for_status()
+        """Stream the local Ollama response and support cancellation."""
 
-        result = response.json()
-        content = result.get("message", {}).get("content")
+        content_parts = []
+        final_result = {}
+
+        try:
+            with httpx.stream(
+                "POST",
+                f"{settings.ollama_base_url.rstrip('/')}/api/chat",
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "format": "json",
+                    "stream": True,
+                    "options": {
+                        "temperature": 0.1,
+                    },
+                },
+                timeout=httpx.Timeout(900, connect=10),
+            ) as response:
+                if cancellation:
+                    cancellation.attach_response(response)
+
+                try:
+                    if cancellation:
+                        cancellation.raise_if_cancelled()
+
+                    response.raise_for_status()
+
+                    for line in response.iter_lines():
+                        if cancellation:
+                            cancellation.raise_if_cancelled()
+
+                        if not line:
+                            continue
+
+                        chunk = json.loads(line)
+
+                        message = chunk.get("message", {})
+                        text = message.get("content", "")
+
+                        if text:
+                            content_parts.append(text)
+
+                        if chunk.get("done"):
+                            final_result = chunk
+
+                finally:
+                    if cancellation:
+                        cancellation.detach_response(response)
+
+            if cancellation:
+                cancellation.raise_if_cancelled()
+
+        except httpx.HTTPError as exc:
+            if cancellation and cancellation.cancelled:
+                raise ReviewCancelledError("Review cancelled by user.") from exc
+
+            raise ReviewServiceError(f"Unable to communicate with Ollama: {exc}") from exc
+
+        content = "".join(content_parts)
 
         if not content:
             raise ReviewServiceError("Ollama returned an empty response.")
 
         usage = {
-            "prompt_tokens": result.get("prompt_eval_count", 0),
-            "completion_tokens": result.get("eval_count", 0),
+            "prompt_tokens": final_result.get("prompt_eval_count", 0),
+            "completion_tokens": final_result.get("eval_count", 0),
             "cost": None,
         }
 
-        return content, usage, result.get("model", model)
+        return content, usage, final_result.get("model", model)
 
     def _review_openrouter(
         self,
@@ -187,6 +289,7 @@ class ReviewService:
         user_prompt: str,
     ) -> tuple[str, dict, str]:
         """Send the review request to OpenRouter."""
+
         api_key = settings.openrouter_api_key
 
         if not api_key:
@@ -230,6 +333,7 @@ class ReviewService:
     @staticmethod
     def _parse_content(content: str) -> dict:
         """Parse the model response and validate its top-level structure."""
+
         content = re.sub(
             r"^\s*```(?:json)?\s*|\s*```\s*$",
             "",
@@ -238,6 +342,7 @@ class ReviewService:
 
         try:
             parsed = json.loads(content)
+
         except json.JSONDecodeError as exc:
             raise ReviewServiceError(f"The model did not return valid JSON: {exc}") from exc
 

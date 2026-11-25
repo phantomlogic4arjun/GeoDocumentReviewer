@@ -1,3 +1,5 @@
+import queue
+import threading
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -15,6 +17,8 @@ from geo_document_reviewer.review.models import (
     ReviewerStatus,
 )
 from geo_document_reviewer.review.service import (
+    ReviewCancellation,
+    ReviewCancelledError,
     ReviewService,
     ReviewServiceError,
 )
@@ -44,6 +48,131 @@ def get_openrouter_models():
     return ReviewService.list_openrouter_models()
 
 
+def _run_review_job(
+    processed,
+    topics,
+    review_mode,
+    ollama_model,
+    openrouter_model,
+    result_queue,
+    cancellation,
+):
+    """Run AI reviews in a background thread without accessing Streamlit."""
+
+    results = {}
+
+    try:
+        if review_mode in ["Local Ollama only", "Compare both"]:
+            result_queue.put(("stage", "local"))
+
+            results["Local Ollama"] = ReviewService(
+                provider="ollama",
+                model=ollama_model,
+            ).review(
+                processed,
+                topics,
+                cancellation=cancellation,
+            )
+
+        cancellation.raise_if_cancelled()
+
+        if review_mode in ["OpenRouter only", "Compare both"]:
+            result_queue.put(("stage", "openrouter"))
+
+            results["OpenRouter"] = ReviewService(
+                provider="openrouter",
+                model=openrouter_model,
+            ).review(
+                processed,
+                topics,
+            )
+
+        result_queue.put(("completed", results))
+
+    except ReviewCancelledError as exc:
+        result_queue.put(("cancelled", str(exc), results))
+
+    except Exception as exc:
+        result_queue.put(("error", str(exc), results))
+
+
+@st.fragment(run_every=0.5)
+def render_review_job():
+    """Display review progress and allow cancellation."""
+
+    job = st.session_state.get("review_job")
+
+    if not job:
+        return
+
+    terminal_event = None
+
+    # Read all pending worker messages.
+    while True:
+        try:
+            event = job["queue"].get_nowait()
+        except queue.Empty:
+            break
+
+        if event[0] == "stage":
+            job["stage"] = event[1]
+        else:
+            terminal_event = event
+
+    if terminal_event:
+        event_type = terminal_event[0]
+
+        results = terminal_event[1] if event_type == "completed" else terminal_event[2]
+
+        if results:
+            st.session_state["review_results"] = results
+
+            st.session_state["active_result"] = (
+                "Local Ollama" if "Local Ollama" in results else "OpenRouter"
+            )
+
+            st.session_state["decisions"] = {}
+            st.session_state["manual_comments"] = []
+
+        if event_type == "completed":
+            st.session_state["review_notice"] = (
+                "success",
+                "Review completed.",
+            )
+
+        elif event_type == "cancelled":
+            st.session_state["review_notice"] = (
+                "warning",
+                "Local review cancelled. Any previously completed assessment was preserved.",
+            )
+
+        else:
+            st.session_state["review_notice"] = (
+                "error",
+                f"Review failed: {terminal_event[1]}",
+            )
+
+        del st.session_state["review_job"]
+        st.rerun()
+
+    if job["status"] == "cancelling":
+        st.warning("Stopping the local model request...")
+
+    elif job["stage"] == "local":
+        st.info("Reviewing with local Ollama model...")
+
+        if st.button("Stop Review", key="stop_review"):
+            job["cancellation"].cancel()
+            job["status"] = "cancelling"
+            st.rerun()
+
+    elif job["stage"] == "openrouter":
+        st.info("Local review completed. Reviewing with OpenRouter...")
+
+    else:
+        st.info("Starting AI review...")
+
+
 with st.sidebar:
     st.header("Review configuration")
 
@@ -51,13 +180,29 @@ with st.sidebar:
         "Document number",
         value="",
     )
-    revision = st.text_input("Revision", value="0")
+
+    revision = st.text_input(
+        "Revision",
+        value="0",
+    )
+
     reviewer = st.text_input("Reviewer name")
 
     topics = st.multiselect(
         "Review topics",
-        ["Settlement", "Groundwater"],
-        default=["Settlement", "Groundwater"],
+        [
+            "Settlement",
+            "Groundwater",
+            "Bearing Capacity",
+            "Slope Stability",
+            "Earthquake / Seismic",
+            "Liquefaction",
+            "Site Investigation",
+            "Soil Classification",
+            "Foundation Recommendations",
+            "Other",
+        ],
+        default=[],
     )
 
     st.divider()
@@ -138,6 +283,7 @@ with st.sidebar:
             "requirements before using cloud processing."
         )
 
+
 uploaded_file = st.file_uploader(
     "Upload a geotechnical PDF",
     type=["pdf"],
@@ -147,73 +293,91 @@ if uploaded_file is not None:
     st.write(f"**Selected report:** {uploaded_file.name}")
     st.write(f"**File size:** {uploaded_file.size / (1024 * 1024):.2f} MB")
 
-    if st.button("Process PDF and run AI review", type="primary"):
-        if not topics:
-            st.error("Select at least one review topic.")
 
-        elif review_mode in ["Local Ollama only", "Compare both"] and not ollama_model:
-            st.error("A local Ollama model is required for this mode.")
+if st.button(
+    "Process PDF and run AI review",
+    type="primary",
+    disabled="review_job" in st.session_state,
+):
+    if uploaded_file is None:
+        st.error("Upload a PDF before starting the review.")
 
-        elif review_mode in ["OpenRouter only", "Compare both"] and not openrouter_model:
-            st.error("An OpenRouter model is required for this mode.")
+    elif not topics:
+        st.error("Select at least one review topic.")
 
-        elif review_mode in ["OpenRouter only", "Compare both"] and not cloud_consent:
-            st.error(
-                "Authorize sending extracted report text to OpenRouter before running this mode."
+    elif review_mode in ["Local Ollama only", "Compare both"] and not ollama_model:
+        st.error("A local Ollama model is required for this mode.")
+
+    elif review_mode in ["OpenRouter only", "Compare both"] and not openrouter_model:
+        st.error("An OpenRouter model is required for this mode.")
+
+    elif review_mode in ["OpenRouter only", "Compare both"] and not cloud_consent:
+        st.error("Authorize sending extracted report text to OpenRouter before running this mode.")
+
+    else:
+        try:
+            with st.spinner("Processing PDF locally..."):
+                with TemporaryDirectory() as temp_dir:
+                    pdf_path = Path(temp_dir) / uploaded_file.name
+                    pdf_path.write_bytes(uploaded_file.getvalue())
+
+                    processed = DocumentProcessingService().process(pdf_path)
+
+            st.session_state["processed_page_count"] = processed.page_count
+
+            st.session_state["processed_file"] = uploaded_file.name
+
+            result_queue = queue.Queue()
+            cancellation = ReviewCancellation()
+
+            worker = threading.Thread(
+                target=_run_review_job,
+                kwargs={
+                    "processed": processed,
+                    "topics": topics,
+                    "review_mode": review_mode,
+                    "ollama_model": ollama_model,
+                    "openrouter_model": openrouter_model,
+                    "result_queue": result_queue,
+                    "cancellation": cancellation,
+                },
+                daemon=True,
             )
 
-        else:
-            try:
-                with st.spinner("Processing PDF locally..."):
-                    with TemporaryDirectory() as temp_dir:
-                        pdf_path = Path(temp_dir) / uploaded_file.name
-                        pdf_path.write_bytes(uploaded_file.getvalue())
+            st.session_state["review_job"] = {
+                "queue": result_queue,
+                "cancellation": cancellation,
+                "thread": worker,
+                "status": "running",
+                "stage": "starting",
+            }
 
-                        processed = DocumentProcessingService().process(pdf_path)
+            worker.start()
+            st.rerun()
 
-                        st.session_state["processed_page_count"] = processed.page_count
-                        st.session_state["processed_file"] = uploaded_file.name
+        except (ValueError, RuntimeError, ReviewServiceError) as exc:
+            st.error(str(exc))
 
-                        results = {}
+        except Exception as exc:
+            st.error(f"Processing failed: {exc}")
 
-                        if review_mode in [
-                            "Local Ollama only",
-                            "Compare both",
-                        ]:
-                            with st.spinner(f"Reviewing with local model {ollama_model}..."):
-                                results["Local Ollama"] = ReviewService(
-                                    provider="ollama",
-                                    model=ollama_model,
-                                ).review(processed, topics)
 
-                        if review_mode in [
-                            "OpenRouter only",
-                            "Compare both",
-                        ]:
-                            with st.spinner(
-                                f"Reviewing with OpenRouter model {openrouter_model}..."
-                            ):
-                                results["OpenRouter"] = ReviewService(
-                                    provider="openrouter",
-                                    model=openrouter_model,
-                                ).review(processed, topics)
+render_review_job()
 
-                st.session_state["review_results"] = results
+notice = st.session_state.pop("review_notice", None)
 
-                initial_provider = (
-                    "Local Ollama" if review_mode == "Local Ollama only" else "OpenRouter"
-                )
+if notice:
+    notice_type, notice_message = notice
 
-                st.session_state["active_result"] = initial_provider
-                st.session_state["decisions"] = {}
-                st.session_state["manual_comments"] = []
+    if notice_type == "success":
+        st.success(notice_message)
 
-                st.success("Review completed.")
+    elif notice_type == "warning":
+        st.warning(notice_message)
 
-            except (ValueError, RuntimeError, ReviewServiceError) as exc:
-                st.error(str(exc))
-            except Exception as exc:
-                st.error(f"Processing failed: {exc}")
+    else:
+        st.error(notice_message)
+
 
 results = st.session_state.get("review_results", {})
 
@@ -260,6 +424,7 @@ if results:
                 st.write(f"Needs human review: {human_review_count}")
 
                 cost = usage.get("cost")
+
                 st.write(
                     f"Reported cost: ${cost:.6f}"
                     if cost is not None
@@ -305,9 +470,11 @@ if results:
                     "OpenRouter conclusion": cloud_decision,
                     "Same conclusion": (
                         "Yes"
-                        if local_finding
-                        and cloud_finding
-                        and local_finding.decision == cloud_finding.decision
+                        if (
+                            local_finding
+                            and cloud_finding
+                            and local_finding.decision == cloud_finding.decision
+                        )
                         else "No"
                     ),
                     "Local evidence pages": local_pages,
@@ -332,6 +499,7 @@ if results:
     st.subheader("Select assessment for engineering review")
 
     provider_names = list(results.keys())
+
     previous_provider = st.session_state.get(
         "active_result",
         provider_names[0],
@@ -463,6 +631,7 @@ if results:
                         status=ReviewerStatus.REJECTED,
                         reviewer_notes=notes or None,
                     )
+
                 else:
                     decisions.pop(finding.finding_id, None)
 
@@ -520,6 +689,7 @@ if results:
             )
 
             st.success("Manual comment added.")
+
         else:
             st.error("Enter a comment first.")
 
